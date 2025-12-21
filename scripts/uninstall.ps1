@@ -27,20 +27,28 @@ $isJson = $filePath -match '\.json$'
 $apps = @()
 
 if ($isJson) {
-    # Parse JSON and extract itemID values
+    # Parse JSON and extract both itemName and itemID
     try {
         $jsonContent = Get-Content $filePath -Raw | ConvertFrom-Json
         if ($jsonContent -is [Array]) {
-            # Array of objects
-            $apps = $jsonContent | ForEach-Object { $_.itemID }
+            # Array of objects - store objects with name and ID
+            $apps = $jsonContent | ForEach-Object { 
+                [PSCustomObject]@{
+                    Name = $_.itemName
+                    ID = $_.itemID
+                }
+            }
         } elseif ($jsonContent.itemID) {
             # Single object
-            $apps = @($jsonContent.itemID)
+            $apps = @([PSCustomObject]@{
+                Name = $jsonContent.itemName
+                ID = $jsonContent.itemID
+            })
         } else {
             Write-Error "JSON file does not contain 'itemID' fields"
             exit 1
         }
-        Write-Host "Loaded $($apps.Count) app IDs from JSON file"
+        Write-Host "Loaded $($apps.Count) apps from JSON file"
     }
     catch {
         Write-Error "Failed to parse JSON file: $_"
@@ -48,16 +56,29 @@ if ($isJson) {
     }
 } else {
     # Read all non-empty lines (trim whitespace) - text file format
-    $apps = Get-Content $filePath | Where-Object { $_.Trim() -ne '' }
+    # For text files, store as objects with only ID (no name available)
+    $apps = Get-Content $filePath | Where-Object { $_.Trim() -ne '' } | ForEach-Object {
+        [PSCustomObject]@{
+            Name = $null
+            ID = $_.Trim()
+        }
+    }
     Write-Host "Loaded $($apps.Count) app IDs from text file"
 }
 
 foreach ($app in $apps) {
     $startTime = Get-Date
-    Write-Host "Uninstalling: $app"
-    winget uninstall --id $app
+    # Display name and ID if available, otherwise just ID
+    if ($app.Name) {
+        Write-Host "Uninstalling: $($app.Name) ($($app.ID))"
+        $label = "$($app.Name) [$($app.ID)]"
+    } else {
+        Write-Host "Uninstalling: $($app.ID)"
+        $label = $app.ID
+    }
+    winget uninstall --id $app.ID
     $stopTime = Get-Date
     $elapsedTime = New-Timespan -Start $startTime -End $stopTime
-    Add-Content -Path $logPath -Value ("Uninstallation on {0} took {1}" -f $app, $elapsedTime.ToString("mm\:ss"))
+    Add-Content -Path $logPath -Value ("Uninstallation on {0} took {1}" -f $label, $elapsedTime.ToString("mm\:ss"))
 }
 

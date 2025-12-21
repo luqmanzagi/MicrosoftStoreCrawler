@@ -30,7 +30,7 @@ const args = parseCLI(process.argv.slice(2));
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 const DEFAULT_IN  = path.resolve("result", "collection_page_items.json"); // optional list of {href}
-const DEFAULT_OUT = path.resolve("result", "apps_free.json");
+const DEFAULT_OUT = path.resolve("results", "apps_free.json");
 const LIMIT = Number(args.limit || 50);
 
 function extractItemIdFromHref(href) {

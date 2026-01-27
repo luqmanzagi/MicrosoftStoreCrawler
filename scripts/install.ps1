@@ -66,6 +66,9 @@ if ($isJson) {
     Write-Host "Loaded $($apps.Count) app IDs from text file"
 }
 
+# Array to track successfully installed apps
+$successfulInstalls = @()
+
 foreach ($app in $apps) {
     # Display name and ID if available, otherwise just ID
     if ($app.Name) {
@@ -140,7 +143,55 @@ foreach ($app in $apps) {
         }
     }
 
-    Add-Content -Path $logPath -Value ("Install {0} took {1} {2}" -f $label, $elapsed.ToString("mm\:ss"), $status)
+    # Build log entry
+    $logEntry = "Install {0} took {1} {2}" -f $label, $elapsed.ToString("mm\:ss"), $status
+    
+    # If installation failed, append error information
+    if ($status -eq "failure") {
+        if ($errorText) {
+            $logEntry += " - Error: $errorText"
+        } elseif ($text) {
+            # Extract key error messages from output (first few lines that look like errors)
+            $errorLines = ($text -split "`n" | Where-Object { 
+                $_ -match '(?i)(error|failed|exception|not found|unable)' -and 
+                $_.Trim().Length -gt 0 
+            } | Select-Object -First 3)
+            if ($errorLines) {
+                $errorSummary = ($errorLines -join "; ").Trim()
+                # Limit error text length to avoid overly long log entries
+                if ($errorSummary.Length -gt 200) {
+                    $errorSummary = $errorSummary.Substring(0, 197) + "..."
+                }
+                $logEntry += " - Error: $errorSummary"
+            }
+        }
+    }
+    
+    Add-Content -Path $logPath -Value $logEntry
+    
+    # Track successful installations
+    if ($status -eq "success") {
+        $successfulInstalls += [PSCustomObject]@{
+            itemID = $app.ID
+        }
+    }
+}
+
+# Create output JSON file for successfully installed apps
+if ($successfulInstalls.Count -gt 0) {
+    # Determine output filename based on input filename
+    $inputFileName = Split-Path -Leaf $filePath
+    $inputNameWithoutExt = [System.IO.Path]::GetFileNameWithoutExtension($inputFileName)
+    $outputFileName = "uninstall_$inputNameWithoutExt.json"
+    $outputPath = Join-Path (Split-Path -Parent $filePath) $outputFileName
+    
+    # Convert to JSON and save
+    $jsonOutput = $successfulInstalls | ConvertTo-Json
+    $jsonOutput | Out-File -FilePath $outputPath -Encoding UTF8
+    
+    Write-Host "`nSuccessfully installed $($successfulInstalls.Count) app(s). Output saved to: $outputPath"
+} else {
+    Write-Host "`nNo apps were successfully installed."
 }
 
 

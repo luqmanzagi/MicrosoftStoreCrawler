@@ -1,8 +1,8 @@
 // appCrawler.js (ESM) — product-card aware (square-card + price-badge inside shadow DOM)
 // Usage examples:
 //   node appCrawler.js --url "https://apps.microsoft.com/collections/..." --limit 50
-//   node appCrawler.js --in "./result/collection_page_items.json" --limit 50
-//   node appCrawler.js --out "./result/apps_free.json"
+//   node appCrawler.js --in "./results/collection_page_items.json" --limit 50
+//   node appCrawler.js --out "./results/apps_free.json"
 // Tip: add { "type": "module" } to package.json to silence ESM warnings.
 
 import fs from "fs";
@@ -29,9 +29,23 @@ function parseCLI(argv) {
 const args = parseCLI(process.argv.slice(2));
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-const DEFAULT_IN  = path.resolve("result", "collection_page_items.json"); // optional list of {href}
+const DEFAULT_IN  = path.resolve("results", "collection_page_items.json"); // optional list of {href}
 const DEFAULT_OUT = path.resolve("results", "apps_free.json");
+const DEFAULT_URL = "https://apps.microsoft.com/collections/computed/apps/TopFree?hl=en-US&gl=NL";
 const LIMIT = Number(args.limit || 50);
+
+function looksLikeUrl(value) {
+  return typeof value === "string" && /^https?:\/\//i.test(value.trim());
+}
+
+function isFreeCollectionUrl(url) {
+  try {
+    const u = new URL(url);
+    return /topfree|free[-_]?apps|gratis/i.test(`${u.pathname}${u.search}`);
+  } catch {
+    return /topfree|free[-_]?apps|gratis/i.test(String(url || ""));
+  }
+}
 
 function extractItemIdFromHref(href) {
   try {
@@ -51,10 +65,65 @@ function extractItemIdFromHref(href) {
   } catch { return href; }
 }
 
+async function countProductCards(page) {
+  return page.evaluate(() => {
+    function* walk(root = document) {
+      const stack = [root];
+      while (stack.length) {
+        const n = stack.pop();
+        if (!n) continue;
+        yield n;
+        if (n.shadowRoot) stack.push(n.shadowRoot);
+        if (n.children) for (let i = n.children.length - 1; i >= 0; i--) stack.push(n.children[i]);
+      }
+    }
+    let c = 0;
+    for (const n of walk()) {
+      if (n.nodeType === 1 && n.localName === "square-card") {
+        if ((n.getAttribute("class") || "").toLowerCase().includes("product-card")) c++;
+      }
+    }
+    return c;
+  });
+}
+
+async function clickLoadMoreButton(page) {
+  return page.evaluate(() => {
+    function* walk(root = document) {
+      const stack = [root];
+      while (stack.length) {
+        const n = stack.pop();
+        if (!n) continue;
+        yield n;
+        if (n.shadowRoot) stack.push(n.shadowRoot);
+        if (n.children) for (let i = n.children.length - 1; i >= 0; i--) stack.push(n.children[i]);
+      }
+    }
+    for (const n of walk()) {
+      if (!n || n.nodeType !== 1) continue;
+      const cls = (n.getAttribute("class") || "").toLowerCase();
+      if (n.localName !== "wa-button" || !cls.includes("load-more-button")) continue;
+      n.scrollIntoView({ block: "center", inline: "nearest" });
+      try {
+        n.click();
+        return true;
+      } catch {
+        try {
+          n.shadowRoot?.querySelector("button")?.click();
+          return true;
+        } catch {
+          return false;
+        }
+      }
+    }
+    return false;
+  });
+}
+
 async function scrollUntilLoaded(page, wantCount = 50, { maxRounds = 80, idleMs = 1200 } = {}) {
-  let lastHeight = 0, stable = 0;
+  let lastCount = 0;
+  let stable = 0;
   for (let round = 1; round <= maxRounds; round++) {
-    // aggressive scroll burst
     await page.evaluate(() => {
       const step = Math.max(700, Math.floor(window.innerHeight * 0.95));
       for (let i = 0; i < 30; i++) window.scrollBy(0, step);
@@ -62,36 +131,30 @@ async function scrollUntilLoaded(page, wantCount = 50, { maxRounds = 80, idleMs 
     });
     await sleep(idleMs);
 
-    // estimate number of product cards currently in DOM (deep)
-    const count = await page.evaluate(() => {
-      function* walk(root = document) {
-        const stack = [root];
-        while (stack.length) {
-          const n = stack.pop();
-          if (!n) continue;
-          yield n;
-          if (n.shadowRoot) stack.push(n.shadowRoot);
-          if (n.children) for (let i = n.children.length - 1; i >= 0; i--) stack.push(n.children[i]);
-        }
-      }
-      let c = 0;
-      for (const n of walk()) {
-        if (n.nodeType === 1 && n.localName === "square-card") {
-          if ((n.getAttribute("class") || "").toLowerCase().includes("product-card")) c++;
-        }
-      }
-      return c;
-    });
+    const count = await countProductCards(page);
     if (count >= wantCount) break;
 
-    const newHeight = await page.evaluate(() => document.body.scrollHeight);
-    if (newHeight <= lastHeight) stable++; else { stable = 0; lastHeight = newHeight; }
+    const clicked = await clickLoadMoreButton(page);
+    if (clicked) {
+      console.log(`  Clicked load-more (${count} cards, want ${wantCount})`);
+      const started = Date.now();
+      while (Date.now() - started < 8000) {
+        await sleep(500);
+        if (await countProductCards(page) > count) break;
+      }
+      lastCount = await countProductCards(page);
+      stable = 0;
+      continue;
+    }
+
+    if (count <= lastCount) stable++;
+    else { stable = 0; lastCount = count; }
     if (stable >= 3) break;
   }
 }
 
-async function scrapeFreeProductCards(page, limit = 50) {
-  const items = await page.evaluate(({ limit }) => {
+async function scrapeFreeProductCards(page, limit = 50, { treatAllAsFree = false } = {}) {
+  const items = await page.evaluate(({ limit, treatAllAsFree }) => {
     const ORIGIN = location.origin; // "https://apps.microsoft.com"
     const results = [];
     const seen = new Set();
@@ -107,20 +170,38 @@ async function scrapeFreeProductCards(page, limit = 50) {
         if (n.children) for (let i = n.children.length - 1; i >= 0; i--) stack.push(n.children[i]);
       }
     }
-    function climb(node) {
-      const out = [];
-      let cur = node;
-      while (cur) {
-        out.push(cur);
-        if (cur.parentElement) { cur = cur.parentElement; continue; }
-        const root = cur.getRootNode?.();
-        if (root && root instanceof ShadowRoot && root.host) { cur = root.host; continue; }
-        break;
-      }
-      return out;
+
+    function isFreePrice(text) {
+      const t = String(text || "").replace(/\s+/g, " ").trim();
+      if (!t) return false;
+      if (/\b(free|gratis|gratuit|kostenlos|gratuito|grátis|gratuita)\b/i.test(t)) return true;
+      if (/^(€|eur|usd|us\$|\$|£)?\s*0([.,]00)?$/i.test(t)) return true;
+      return false;
     }
 
-    const FREE_RE = /\bfree\b/i;
+    function getPriceText(card) {
+      const roots = [card.shadowRoot, card].filter(Boolean);
+      for (const scope of roots) {
+        const badge = scope.querySelector?.("price-badge");
+        const candidates = [
+          badge?.shadowRoot?.querySelector('[part="price-container"], .price-container'),
+          badge?.querySelector?.('[part="price-container"], .price-container'),
+          scope.querySelector?.('[part="price-container"], .price-container'),
+        ];
+        for (const el of candidates) {
+          const t = (el?.textContent || "").replace(/\s+/g, " ").trim();
+          if (t) return t;
+        }
+      }
+      for (const n of walk(card.shadowRoot || card)) {
+        if (n.nodeType !== 1) continue;
+        const cls = `${n.getAttribute("class") || ""} ${n.getAttribute("part") || ""}`;
+        if (!/price-container/.test(cls)) continue;
+        const t = (n.textContent || "").replace(/\s+/g, " ").trim();
+        if (t) return t;
+      }
+      return "";
+    }
 
     // Find all <square-card class="product-card"> even if they sit inside other web components
     const cards = [];
@@ -135,19 +216,8 @@ async function scrapeFreeProductCards(page, limit = 50) {
       const root = card.shadowRoot;
       if (!root) continue;
 
-      // price: <price-badge> has its own shadowRoot; inside it a div[part="price-container"]
-      let priceText = "";
-      const priceBadge = root.querySelector("price-badge");
-      if (priceBadge?.shadowRoot) {
-        const pc = priceBadge.shadowRoot.querySelector('div[part="price-container"]') ||
-                   priceBadge.shadowRoot.querySelector(".price-container");
-        if (pc) priceText = (pc.textContent || "").replace(/\s+/g, " ").trim();
-      } else {
-        // fallback: sometimes price-container is slotted up
-        const pc = root.querySelector('div[part="price-container"], .price-container');
-        if (pc) priceText = (pc.textContent || "").replace(/\s+/g, " ").trim();
-      }
-      if (!FREE_RE.test(priceText)) continue; // only free
+      const priceText = getPriceText(card);
+      if (!treatAllAsFree && !isFreePrice(priceText)) continue;
 
       // anchor & href inside the card’s shadow
       const a = root.querySelector('a[href*="/detail/"]');
@@ -202,7 +272,7 @@ async function scrapeFreeProductCards(page, limit = 50) {
     }
 
     return results;
-  }, { limit });
+  }, { limit, treatAllAsFree });
 
   // Ensure unique + cap (already capped, but keep safe)
   const uniq = [];
@@ -215,38 +285,90 @@ async function scrapeFreeProductCards(page, limit = 50) {
   return uniq;
 }
 
+async function dismissConsent(page) {
+  try {
+    await page.evaluate(() => {
+      const labels = /accept|agree|allow|accepteren|akkoord|reject|weigeren|only necessary/i;
+      function* walk(root = document) {
+        const stack = [root];
+        while (stack.length) {
+          const n = stack.pop();
+          if (!n) continue;
+          yield n;
+          if (n.shadowRoot) stack.push(n.shadowRoot);
+          if (n.children) for (let i = n.children.length - 1; i >= 0; i--) stack.push(n.children[i]);
+        }
+      }
+      for (const n of walk()) {
+        if (!n || n.nodeType !== 1) continue;
+        const tag = n.localName;
+        const role = n.getAttribute?.("role") || "";
+        const text = (n.textContent || "").replace(/\s+/g, " ").trim();
+        if ((tag === "button" || role === "button") && labels.test(text) && text.length < 48) {
+          try { n.click(); } catch {}
+          return;
+        }
+      }
+    });
+    await sleep(400);
+  } catch {}
+}
+
+async function waitForProductCards(page, timeout = 30_000) {
+  try {
+    await page.waitForFunction(() => {
+      function* walk(root = document) {
+        const stack = [root];
+        while (stack.length) {
+          const n = stack.pop();
+          if (!n) continue;
+          yield n;
+          if (n.shadowRoot) stack.push(n.shadowRoot);
+          if (n.children) for (let i = n.children.length - 1; i >= 0; i--) stack.push(n.children[i]);
+        }
+      }
+      for (const n of walk()) {
+        if (n.nodeType === 1 && n.localName === "square-card") return true;
+      }
+      return false;
+    }, { timeout });
+  } catch {}
+}
+
 async function crawlOneUrl(browser, url, limit) {
   const page = await browser.newPage();
   await page.setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36");
-  await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9" });
+  await page.setExtraHTTPHeaders({ "Accept-Language": "en-US,en;q=0.9,nl-NL;q=0.8" });
   await page.setViewport({ width: 1366, height: 900 });
 
-  await page.goto(url, { waitUntil: "networkidle2", timeout: 120_000 });
-  // If a consent banner blocks content in your region, click it here.
-  // try { await page.click('button:has-text("Accept")', { timeout: 3000 }); } catch {}
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120_000 });
+  await dismissConsent(page);
+  await waitForProductCards(page);
 
   await scrollUntilLoaded(page, limit);
-  const items = await scrapeFreeProductCards(page, limit);
+  const items = await scrapeFreeProductCards(page, limit, {
+    treatAllAsFree: isFreeCollectionUrl(url),
+  });
   await page.close();
   return items;
 }
 
 function loadTargets({ inFile, startUrl }) {
-  // If you have a file from previous crawler: [{ title, href }]
+  if (startUrl) return [startUrl];
   if (inFile && fs.existsSync(inFile)) {
     const raw = JSON.parse(fs.readFileSync(inFile, "utf-8"));
     const hrefs = Array.isArray(raw) ? raw.map(r => (typeof r === "string" ? r : r?.href)).filter(Boolean) : [];
     if (hrefs.length) return hrefs;
   }
-  if (startUrl) return [startUrl];
-  // fallback: apps hub
-  return ["https://apps.microsoft.com/apps?hl=en-US&gl=US"];
+  return [DEFAULT_URL];
 }
 
 async function main() {
-  const inFile  = args.in ? path.resolve(args.in) : DEFAULT_IN;
+  const inArg = args.in && args.in !== true ? String(args.in) : "";
+  const urlArg = args.url && args.url !== true ? String(args.url) : "";
+  const startUrl = looksLikeUrl(urlArg) ? urlArg.trim() : (looksLikeUrl(inArg) ? inArg.trim() : "");
+  const inFile = inArg && !looksLikeUrl(inArg) ? path.resolve(inArg) : (startUrl ? "" : DEFAULT_IN);
   const outFile = args.out ? path.resolve(args.out) : DEFAULT_OUT;
-  const startUrl = args.url;
 
   fs.mkdirSync(path.dirname(outFile), { recursive: true });
 

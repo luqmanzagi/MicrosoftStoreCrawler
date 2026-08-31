@@ -1,39 +1,37 @@
 # runAppCrawler.ps1
-# Usage:  .\runAppCrawler.ps1 [-Limit 50]
+# Usage:  .\runAppCrawler.ps1 [-url <inputURL>] [-Limit <inputLimit>]
 param(
+    [string]$url = "https://apps.microsoft.com/collections/computed/apps/TopFree?hl=en&gl=NL",
     [int]$Limit = 50
 )
 
-$inputList = ".\results\collection_href.txt"
+$ErrorActionPreference = "Stop"
 
-if (-not (Test-Path $inputList)) {
-    Write-Error "Missing input file: $inputList"
-    exit 1
+$repoRoot = $PSScriptRoot
+$resultsDir = Join-Path $repoRoot "results"
+$today = Get-Date -Format "yyyy-MM-dd"
+$outFile = Join-Path $resultsDir "app_$today.json"
+
+$crawlAppData = Join-Path $repoRoot "scripts\crawlAppData.js"
+$crawlAppCat = Join-Path $repoRoot "scripts\crawlAppCat.js"
+
+if (-not (Test-Path $resultsDir)) {
+    New-Item -ItemType Directory -Path $resultsDir | Out-Null
 }
 
-# Ensure results folder exists
-if (-not (Test-Path ".\results")) {
-    New-Item -ItemType Directory -Path ".\results" | Out-Null
+Write-Host "Crawling apps from $url (limit $Limit)"
+Write-Host "Output: $outFile"
+node $crawlAppData --url $url --out $outFile --limit $Limit
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "crawlAppData.js failed with exit code $LASTEXITCODE"
+    exit $LASTEXITCODE
 }
 
-# Read all non-empty lines (one URL per line)
-$apps = Get-Content $inputList | Where-Object { $_.Trim() -ne '' }
-
-foreach ($app in $apps) {
-    try {
-        $uri = [uri]$app
-    } catch {
-        Write-Warning "Skipping invalid URL: $app"
-        continue
-    }
-
-    # Take the last path segment that doesn't start with '_' as the collection name
-    $segments = $uri.AbsolutePath.Trim('/') -split '/'
-    $collectionName = ($segments | Where-Object { $_ -and $_[0] -ne '_' } | Select-Object -Last 1)
-    if (-not $collectionName) { $collectionName = 'output' }
-
-    $outFile = Join-Path ".\results\free_app" ($collectionName + ".json")
-
-    Write-Host "Crawling collection '$collectionName' from $app"
-    node appCrawler.js --url "$app" --out "$outFile" --limit $Limit
+Write-Host "Crawling categories from $outFile"
+node $crawlAppCat --in $outFile
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "crawlAppCat.js failed with exit code $LASTEXITCODE"
+    exit $LASTEXITCODE
 }
+
+Write-Host "Done. Results saved to $outFile"
